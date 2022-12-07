@@ -1,12 +1,20 @@
 import functools
-from functools import reduce
 from typing import Callable, Optional, Union, NamedTuple, Any, Tuple, Dict, List
 
 import chex
 import jax
 import jax.numpy as jnp
-import numpy as np
+from jax.flatten_util import ravel_pytree
 import optax
+from optax._src.wrappers import ShouldSkipUpdateFunction
+import functools
+from typing import Callable, Optional, Union, NamedTuple, Any, Tuple, Dict, List
+
+import chex
+import jax
+import jax.numpy as jnp
+import optax
+from jax.flatten_util import ravel_pytree
 from optax._src.wrappers import ShouldSkipUpdateFunction
 
 
@@ -14,21 +22,6 @@ def build_multi_step_optimizer(learning_rate):
     optimizer = optax.adam(learning_rate=learning_rate)
     multi_step_optimizer = optax.MultiSteps(optimizer, every_k_schedule=2)
     return multi_step_optimizer
-
-
-class PCGradOptimizer:
-
-    def __init__(self, params, task_names):
-        self.acc_grads = {}
-        for task_name in task_names:
-            self.acc_grads[task_name] = params
-            self.acc_grads[task_name] = jax.tree_util.tree_map(lambda x: 0, self.acc_grads[task_name])
-
-    def update(self, grads, task):
-        self.acc_grads[task] = jax.tree_util.tree_map(lambda x, y: x + y, self.acc_grads[task], grads)
-
-    def accumulate(self):
-        pass
 
 
 class PCGraxState(NamedTuple):
@@ -90,102 +83,59 @@ class PCGrax(optax.MultiSteps):
             del args
 
             # Flatten grads into vector
-            def flatten_grads(grads: Dict[str, chex.ArrayTree]) -> Tuple[
-                Dict[str, jnp.ndarray], chex.PyTreeDef, List[int]]:
-                """
+            raveled_grads_per_task = {k: ravel_pytree(grads) for k, grads in state.grads_per_task.items()}
 
-                :param grads: Gradients for each task, each task represented by a PyTree
-                :return:
-                        flattened grads: Gradients for each task, each task represented by a 1D vector
-                        tree_def: The information of the PyTree structure, to be used to unflatten later
-                        layer_shapes: Shape of each layer in the Network, to be used to unflatten later
-                """
-                flattened_grads = {}
-                # For each task in the gradient unflatten the tree to a list of layers
-                for task_name in grads:
-                    grad_vector = jnp.zeros(shape=(0,))
-                    list_of_layers, _ = jax.tree_util.tree_flatten(grads[task_name])  # transform Grad to List of Layers
-                    for layer in list_of_layers:
-                        grad_vector = jnp.concatenate((grad_vector, layer.flatten()))  # transform Layer to 1D vector
-                    flattened_grads[task_name] = grad_vector
-
-                # Get tree_def and layer_shapes
-                layered_grads, tree_def = jax.tree_util.tree_flatten(list(grads.values())[0])
-                layer_shapes = []
-                for layer in layered_grads:
-                    layer_shapes.append(layer.shape)
-
-                return flattened_grads, tree_def, layer_shapes
-
-            flatten_grads, tree_def, layer_shapes = flatten_grads(grads=state.grads_per_task)
-
+            
             def project_grads(flattened_grads: Dict[str, jnp.ndarray], rng: chex.PRNGKey) -> List[jnp.ndarray]:
                 """
-
                 :param flattened_grads: Dictionary of 1D vectors representing gradients for each task
                 :param rng: random key for shuffling the order of projections
                 :return: returns the list of projected gradients
                 """
 
-                def apply_projection(v1, v2):
+                def apply_projection(i, info):
                     """
                     Project source vector to be orthogonal to v2 if they are conflicting, noop otherwise
                     :param v1: source vector
                     :param v2: target vector
                     :return: projected_vector
                     """
-                    inner_product = jnp.dot(v1, v2)
-                    projection_direction = inner_product / jnp.dot(v2, v2)
-                    v1 = v1 - jnp.minimum(projection_direction, 0) * v2
-                    return v1
+                    v1 = info['source']
+                    grads = info['flattened_grads']
+                    shuffled_order = info['shuffled_order']
+
+                    idx = shuffled_order[i]
+                    inner_product = jnp.dot(v1, grads[idx])
+                    projection_direction = inner_product / jnp.dot(grads[idx], grads[idx])
+                    v1 = v1 - jnp.minimum(projection_direction, 0) * grads[idx]
+
+                    info['source'] = v1
+                    return info
 
                 shuffled_order = jax.random.permutation(rng, len(flattened_grads))  # Randomize the order of projections
 
-                projected_grads = []
-                # For each source gradient
-                for task_source in flattened_grads:
-                    source_task_grad = flattened_grads[task_source]
-                    # Project the source to every gradient
-                    # It's ok to project a vector to itself (v1->v1), nothing will change
-                    for k in shuffled_order:
-                        target_task_grad = list(flattened_grads.values())[k]
-                        source_task_grad = apply_projection(source_task_grad, target_task_grad)
-                    projected_grads.append(source_task_grad)
+                grad_length = len(flattened_grads[list(flattened_grads.keys())[0]][0])
+                flattened_grads_new = jnp.zeros(shape=(len(flattened_grads.keys()), grad_length))
+                for i, key in enumerate(flattened_grads.keys()):
+                    flattened_grads_new = flattened_grads_new.at[i].set(flattened_grads[key][0])
+
+                def apply_task_projections(source_task_grad):
+                    info = {'source': source_task_grad,
+                            'flattened_grads': flattened_grads_new,
+                            'shuffled_order': shuffled_order}
+                    info = jax.lax.fori_loop(lower=0, upper=len(shuffled_order), body_fun=apply_projection,
+                                                         init_val=info)
+                    return info['source']
+
+                projected_grads = jax.vmap(apply_task_projections)(flattened_grads_new)
                 return projected_grads
 
-            projected_vectors = project_grads(flatten_grads, rng)
+            projected_vectors = project_grads(raveled_grads_per_task, rng)
             projected_vector = jnp.mean(jnp.asarray(projected_vectors), axis=0)
 
-            def restore_original_shape(projected_vector: jnp.ndarray, tree_def: chex.PyTreeDef,
-                                       layer_shapes: List[int]):
-                """
-                Takes in a gradient in a form of the vector, and unflattens it to represent the original gradient shape
-                :param projected_vector: Accumulated projected gradient vector
-                :param tree_def: Original definition of the gradient's PyTree structure
-                :param layer_shapes: Shapes of the network layers
-                :return: Accumulated projected gradient in a PyTree form
-                """
-                # Determine respective layer's start/end indices in the 1D vector based on the layer shapes
-                layer_sizes = []
-                for layer_shape in layer_shapes:
-                    layer_size = reduce(lambda x, y: x * y, np.asarray(layer_shape))
-                    layer_sizes.append(layer_size)
-                layer_sections = np.concatenate((np.zeros(1, dtype=int), np.cumsum(layer_sizes)))
-
-                # Create the list of layers based on the start/end indices
-                reshaped_layers = []
-                for i in range(1, len(layer_sections)):
-                    start = layer_sections[i - 1]
-                    end = layer_sections[i]
-                    layer_section = projected_vector[start:end]
-                    reshaped_layer = layer_section.reshape(layer_shapes[i - 1])
-                    reshaped_layers.append(reshaped_layer)
-
-                # Unflatten into a PyTree given tree_def and the list of layers
-                task_grad_pytree = jax.tree_unflatten(tree_def, reshaped_layers)
-                return task_grad_pytree
-
-            projected_grads = restore_original_shape(projected_vector, tree_def, layer_shapes)
+            # raveled_grads_per_taks shape is (Dict[task_name, Tuple(grads, unravel_fn))
+            unravel_fn = list(raveled_grads_per_task.values())[0][1]
+            projected_grads = unravel_fn(projected_vector)
 
             # Do the update based on the projected gradients
             final_updates, new_inner_state = self._opt.update(
