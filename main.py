@@ -2,11 +2,16 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 import optax
+from optax._src.schedule import InjectHyperparamsState
 
 from model import ConvNet
-from optimizers import PCGrax, build_multi_step_optimizer
+from optimizers import init_optimizer_fn, PCGraxState
 from prepare_data import load_data
 
+# jax.config.update("jax_disable_jit", True)
+learning_rate = 0.001
+task_names = ['mnist', 'fashion']
+optimizer = init_optimizer_fn(learning_rate=learning_rate, task_names=task_names)
 
 
 def cross_entropy_loss(weights, input_data, actual):
@@ -16,36 +21,44 @@ def cross_entropy_loss(weights, input_data, actual):
     return - jnp.mean(one_hot_actual * log_preds)
 
 
-def batch_update_iteration(train_x, train_y, model_params, task_name, optimizer, optimizer_state, rng):
+def batch_update_iteration(train_x, train_y, model_params, task_idx, optimizer_state, rng):
     loss, grads = jax.value_and_grad(cross_entropy_loss)(model_params, train_x, train_y)
-    network_updates, new_optimizer_state = optimizer.update(updates=grads, state=optimizer_state, task=task_name, rng=rng)
+
+    # Add task_idx and rng to the optimizer state
+    opt_inner_state = PCGraxState(
+        mini_step=optimizer_state.inner_state.mini_step,
+        gradient_step=optimizer_state.inner_state.gradient_step,
+        inner_opt_state=optimizer_state.inner_state.inner_opt_state,
+        grads_per_task=optimizer_state.inner_state.grads_per_task,
+        task_idx=task_idx,
+        projection_rng=rng,
+        skip_state=optimizer_state.inner_state)
+
+    optimizer_state = InjectHyperparamsState(
+        count=optimizer_state.count,
+        hyperparams=optimizer_state.hyperparams,
+        inner_state=opt_inner_state,
+    )
+    network_updates, new_optimizer_state = optimizer.update(updates=grads, state=optimizer_state)
     new_params = optax.apply_updates(model_params, network_updates)
     return loss, grads, new_params, new_optimizer_state
 
 
 if __name__ == "__main__":
-    jax.config.update("jax_disable_jit", True)
+
     rng = jax.random.PRNGKey(42)
-    learning_rate = 0.001
     batch_size = 16
     epochs = 100
-
     # Load data
-    fashion_train_x, fashion_test_x, fashion_train_y, fashion_test_y = load_data('fashion')
     mnist_train_x, mnist_test_x, mnist_train_y, mnist_test_y = load_data('mnist')
+    fashion_train_x, fashion_test_x, fashion_train_y, fashion_test_y = load_data('fashion')
 
     # Create and initialize model
     model = conv_net = hk.transform(ConvNet)
     params = conv_net.init(rng, mnist_train_x[:1])
 
-    # Create and initialize optimizer
-    # optimizer = build_multi_step_optimizer(learning_rate=learning_rate)
-    # optimizer_state = optimizer.init(params)
-
     # Testing PCGrad
-    task_names = ['mnist', 'fashion']
-    optimizer = PCGrax(optax.adam(learning_rate=1e-3), 4 * len(task_names))
-    optimizer_state = optimizer.init(params, task_names)
+    optimizer_state = optimizer.init(params)
 
     for i in range(1, epochs + 1):
         batches = jnp.arange((mnist_train_x.shape[0] // batch_size) + 1)  ### Batch Indices
@@ -58,26 +71,26 @@ if __name__ == "__main__":
             else:
                 start, end = int(batch * batch_size), None
 
+            jitted_batch_updated_iteration = jax.jit(batch_update_iteration)
             # Batch update iteration MNIST
             rng, rng_update = jax.random.split(rng, 2)
-            loss_mnist, grads_mnist, params, optimizer_state = batch_update_iteration(
+            loss_mnist, grads_mnist, params, optimizer_state = jitted_batch_updated_iteration(
                 mnist_train_x[start:end],
                 mnist_train_y[start:end],
                 model_params=params,
-                task_name='mnist',
-                optimizer=optimizer,
+                task_idx=0,
                 optimizer_state=optimizer_state,
                 rng=rng_update
             )
 
             # Batch update iteration FASHION
             rng, rng_update = jax.random.split(rng, 2)
-            loss_fashion, grads_fashion, params, optimizer_state = batch_update_iteration(
+
+            loss_fashion, grads_fashion, params, optimizer_state = jitted_batch_updated_iteration(
                 fashion_train_x[start:end],
                 fashion_train_y[start:end],
                 model_params=params,
-                task_name='fashion',
-                optimizer=optimizer,
+                task_idx=1,
                 optimizer_state=optimizer_state,
                 rng=rng_update
             )
